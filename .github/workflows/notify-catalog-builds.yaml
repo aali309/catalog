@@ -1,0 +1,119 @@
+name: Notify Catalog Build Completion
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Cancel the previous monitoring run for the same PR when new commits are pushed,
+# since PAC will cancel in-progress pipelines and start fresh ones.
+concurrency:
+  group: catalog-build-notify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    name: Wait and Notify Catalog Builds
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Wait for Konflux PR build checks
+        id: poll
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          REPO="${{ github.repository }}"
+          CHECK_CREATION_TIMEOUT=600
+          OVERALL_TIMEOUT=7200
+          SECONDS=0
+
+          echo "Monitoring Konflux PR builds on commit $HEAD_SHA..."
+
+          while (( SECONDS < OVERALL_TIMEOUT )); do
+            CHECK_RUNS=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              --paginate --jq '.check_runs' 2>/dev/null || echo '[]')
+
+            # Use latest check-run per name in case PAC cancelled and restarted a build
+            ALL_RUNS=$(echo "$CHECK_RUNS" | jq -s '
+              (add // []) |
+              group_by(.name) |
+              map(sort_by(.started_at // .created_at // "") | last)
+            ')
+
+            KONFLUX=$(jq '[.[] | select(
+              (.app.slug // "" | test("konflux"; "i")) or
+              (.name // "" | test("Red Hat Konflux"; "i"))
+            )]' <<< "$ALL_RUNS")
+
+            TOTAL=$(jq 'length' <<< "$KONFLUX")
+
+            if (( TOTAL == 0 )); then
+              if (( SECONDS >= CHECK_CREATION_TIMEOUT )); then
+                echo "No Konflux check-runs appeared within timeout. Skipping notification."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Waiting for Konflux checks to appear..."
+              sleep 60
+              continue
+            fi
+
+            PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<< "$KONFLUX")
+
+            if (( PENDING > 0 )); then
+              COMPLETED=$(( TOTAL - PENDING ))
+              echo "Waiting... ($COMPLETED/$TOTAL completed, $PENDING pending)"
+              sleep 60
+              continue
+            fi
+
+            SUCCEEDED=$(jq '[.[] | select(.conclusion == "success")] | length' <<< "$KONFLUX")
+            FAILED=$(jq '[.[] | select(
+              .conclusion != "success" and
+              .conclusion != "neutral" and
+              .conclusion != "skipped" and
+              .conclusion != "action_required"
+            )] | length' <<< "$KONFLUX")
+
+            echo "All $TOTAL Konflux builds completed: $SUCCEEDED passed, $FAILED failed."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+            echo "succeeded=$SUCCEEDED" >> "$GITHUB_OUTPUT"
+            echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+
+          echo "Timed out waiting for Konflux builds after 2 hours."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Set status icon
+        id: status
+        if: steps.poll.outputs.skip != 'true'
+        run: |
+          if [[ "${{ steps.poll.outputs.failed }}" == "0" ]]; then
+            echo "icon=:large_green_circle:" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=:large_yellow_circle:" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Slack notification
+        if: steps.poll.outputs.skip != 'true'
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.icon }} *Catalog PR #${{ github.event.pull_request.number }} builds completed*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.status.outputs.icon }} *Catalog builds completed for <${{ github.event.pull_request.html_url }}|PR #${{ github.event.pull_request.number }}>*\n*Branch:* `${{ github.head_ref }}`\n*Results:* ${{ steps.poll.outputs.succeeded }}/${{ steps.poll.outputs.total }} passed, ${{ steps.poll.outputs.failed }} failed\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+                  }
+                }
+              ]
+            }
